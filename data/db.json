@@ -21,7 +21,16 @@
       "endBeat": 32,
       "laneRange": "1-10",
       "checked": true,
-      "note": "开头主题已试奏"
+      "note": "开头主题已试奏",
+      "version": 1,
+      "proofState": "confirmed",
+      "trialResult": {
+        "note": "开头主题已试奏",
+        "submittedBy": null,
+        "submittedAt": null
+      },
+      "claimedBy": null,
+      "confirmedAt": null
     },
     {
       "id": "section_demo_2",
@@ -30,7 +39,12 @@
       "endBeat": 64,
       "laneRange": "4-18",
       "checked": false,
-      "note": "副歌段等待校对"
+      "note": "副歌段等待校对",
+      "version": 0,
+      "proofState": "pending",
+      "trialResult": null,
+      "claimedBy": null,
+      "confirmedAt": null
     }
   ],
   "issues": [
@@ -46,5 +60,6 @@
       "createdAt": "2026-06-16T00:00:00.000Z",
       "resolvedAt": null
     }
-  ]
+  ],
+  "locks": []
 }

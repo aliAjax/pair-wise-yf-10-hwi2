@@ -1,60 +1,12 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+const { readFile, writeFile } = require("fs/promises");
+const { readDb, writeDb } = require("./lib/store");
+const { httpError } = require("./lib/errors");
+const occupancy = require("./lib/occupancy");
+const { bumpVersion } = require("./lib/versioning");
+const proofreading = require("./lib/proofreading");
 
 const PORT = Number(process.env.PORT || 3019);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  tunes: [
-    {
-      id: "tune_demo",
-      title: "雨后圆舞曲",
-      composer: "匿名",
-      stripSpec: {
-        widthMm: 70,
-        scale: "20音",
-        tempoBpm: 82,
-        paperType: "半透明纸带"
-      },
-      createdAt: new Date().toISOString()
-    }
-  ],
-  sections: [
-    {
-      id: "section_demo_1",
-      tuneId: "tune_demo",
-      startBeat: 1,
-      endBeat: 32,
-      laneRange: "1-10",
-      checked: true,
-      note: "开头主题已试奏"
-    },
-    {
-      id: "section_demo_2",
-      tuneId: "tune_demo",
-      startBeat: 33,
-      endBeat: 64,
-      laneRange: "4-18",
-      checked: false,
-      note: "副歌段等待校对"
-    }
-  ],
-  issues: [
-    {
-      id: "issue_demo",
-      tuneId: "tune_demo",
-      sectionId: "section_demo_2",
-      type: "漏孔",
-      beat: 41,
-      lane: 12,
-      description: "第41拍高音孔漏打",
-      status: "open",
-      createdAt: new Date().toISOString(),
-      resolvedAt: null
-    }
-  ]
-};
 
 const routes = [
   "GET /health",
@@ -65,28 +17,15 @@ const routes = [
   "POST /tunes/:id/sections",
   "GET /tunes/:id/unchecked-sections",
   "PATCH /sections/:id/check",
+  "POST /sections/:id/claim",
+  "DELETE /sections/:id/claim",
+  "POST /sections/:id/trial",
+  "POST /sections/:id/review",
+  "GET /occupancy",
   "GET /issues",
   "POST /issues",
   "PATCH /issues/:id/status"
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -105,9 +44,7 @@ async function parseBody(req) {
   try {
     return JSON.parse(raw);
   } catch {
-    const error = new Error("请求体必须是合法JSON");
-    error.status = 400;
-    throw error;
+    throw httpError(400, "请求体必须是合法JSON", "INVALID_JSON");
   }
 }
 
@@ -117,50 +54,26 @@ function makeId(prefix) {
 
 function required(body, fields) {
   const missing = fields.filter((field) => body[field] === undefined || body[field] === "");
-  if (missing.length) {
-    const error = new Error(`缺少字段：${missing.join(", ")}`);
-    error.status = 400;
-    throw error;
-  }
+  if (missing.length) throw httpError(400, `缺少字段：${missing.join(", ")}`, "MISSING_FIELDS", { missing });
 }
 
 function findTune(db, tuneId) {
   const tune = db.tunes.find((item) => item.id === tuneId);
-  if (!tune) {
-    const error = new Error("曲目不存在");
-    error.status = 404;
-    throw error;
-  }
+  if (!tune) throw httpError(404, "曲目不存在", "TUNE_NOT_FOUND", { tuneId });
   return tune;
-}
-
-function buildProgress(db, tuneId) {
-  findTune(db, tuneId);
-  const sections = db.sections.filter((item) => item.tuneId === tuneId);
-  const issues = db.issues.filter((item) => item.tuneId === tuneId);
-  const checkedCount = sections.filter((item) => item.checked).length;
-  const openIssues = issues.filter((item) => item.status !== "resolved").length;
-  return {
-    tuneId,
-    totalSections: sections.length,
-    checkedSections: checkedCount,
-    uncheckedSections: sections.length - checkedCount,
-    openIssues,
-    resolvedIssues: issues.length - openIssues,
-    percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0
-  };
 }
 
 async function handle(req, res) {
   const { pathname, searchParams } = parseUrl(req);
   const db = await readDb();
+  const now = Date.now();
 
   if (req.method === "GET" && pathname === "/health") {
     return send(res, 200, { ok: true, service: "organ-strip-punch-api", routes });
   }
 
   if (req.method === "GET" && pathname === "/tunes") {
-    const tunes = db.tunes.map((tune) => ({ ...tune, progress: buildProgress(db, tune.id) }));
+    const tunes = db.tunes.map((tune) => ({ ...tune, progress: proofreading.buildProgress(db, tune.id, now) }));
     return send(res, 200, { data: tunes });
   }
 
@@ -183,7 +96,10 @@ async function handle(req, res) {
   if (tuneSectionsMatch && req.method === "GET") {
     const tuneId = tuneSectionsMatch[1];
     findTune(db, tuneId);
-    return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId) });
+    const sections = db.sections
+      .filter((item) => item.tuneId === tuneId)
+      .map((section) => proofreading.decorateSection(db, section, now));
+    return send(res, 200, { data: sections });
   }
 
   if (tuneSectionsMatch && req.method === "POST") {
@@ -198,25 +114,93 @@ async function handle(req, res) {
       endBeat: Number(body.endBeat),
       laneRange: body.laneRange,
       checked: Boolean(body.checked),
-      note: body.note || ""
+      note: body.note || "",
+      version: 0,
+      proofState: "pending",
+      trialResult: null,
+      claimedBy: null,
+      confirmedAt: null
     };
     db.sections.push(section);
     await writeDb(db);
-    return send(res, 201, { data: section });
+    return send(res, 201, { data: proofreading.decorateSection(db, section, now) });
   }
 
   const uncheckedMatch = pathname.match(/^\/tunes\/([^/]+)\/unchecked-sections$/);
   if (uncheckedMatch && req.method === "GET") {
     const tuneId = uncheckedMatch[1];
     findTune(db, tuneId);
-    return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId && !item.checked) });
+    const sections = db.sections
+      .filter((item) => item.tuneId === tuneId && !item.checked)
+      .map((section) => proofreading.decorateSection(db, section, now));
+    return send(res, 200, { data: sections });
   }
 
   const progressMatch = pathname.match(/^\/tunes\/([^/]+)\/progress$/);
   if (progressMatch && req.method === "GET") {
-    return send(res, 200, { data: buildProgress(db, progressMatch[1]) });
+    findTune(db, progressMatch[1]);
+    return send(res, 200, { data: proofreading.buildProgress(db, progressMatch[1], now) });
   }
 
+  // —— 校对占用 / 试奏流程 ——
+
+  const claimMatch = pathname.match(/^\/sections\/([^/]+)\/claim$/);
+  if (claimMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    required(body, ["holder"]);
+    const result = proofreading.claimSection(db, claimMatch[1], String(body.holder), {
+      ttlMs: body.ttlMs === undefined ? undefined : Number(body.ttlMs),
+      now
+    });
+    await writeDb(db);
+    return send(res, 200, { message: "占用登记成功", ...result });
+  }
+
+  if (claimMatch && req.method === "DELETE") {
+    const body = await parseBody(req);
+    required(body, ["holder"]);
+    const result = proofreading.cancelClaim(db, claimMatch[1], String(body.holder), { now });
+    await writeDb(db);
+    return send(res, 200, { message: "已退出占用", ...result });
+  }
+
+  const trialMatch = pathname.match(/^\/sections\/([^/]+)\/trial$/);
+  if (trialMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    required(body, ["holder", "version"]);
+    const result = proofreading.submitTrial(db, trialMatch[1], String(body.holder), body.version, body, { now });
+    await writeDb(db);
+    return send(res, 200, { message: "试奏结果已提交，等待确认", ...result });
+  }
+
+  const reviewMatch = pathname.match(/^\/sections\/([^/]+)\/review$/);
+  if (reviewMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    required(body, ["decision"]);
+    const result = proofreading.reviewTrial(db, reviewMatch[1], body.decision, body.note, { now });
+    await writeDb(db);
+    return send(res, 200, { message: body.decision === "confirm" ? "试奏结果已确认" : "试奏结果已驳回", ...result });
+  }
+
+  // 当前处理状态：活动占用 + 待确认数量；重启后仍可查询
+  if (req.method === "GET" && pathname === "/occupancy") {
+    const tuneId = searchParams.get("tuneId");
+    const activeLocks = occupancy.listActive(db, now).map((lock) => {
+      const section = db.sections.find((item) => item.id === lock.sectionId);
+      return { ...occupancy.describeLock(db, lock.sectionId, now), tuneId: section ? section.tuneId : null };
+    });
+    const sections = db.sections.filter((item) => !tuneId || item.tuneId === tuneId);
+    const lockSections = activeLocks.filter((lock) => !tuneId || lock.tuneId === tuneId);
+    return send(res, 200, {
+      data: {
+        activeClaims: lockSections,
+        activeClaimCount: lockSections.length,
+        pendingReview: sections.filter((item) => item.proofState === "submitted").length
+      }
+    });
+  }
+
+  // 旧的直接校对接口：保留，变更时同样推进版本号，避免绕过占用导致版本不一致
   const checkMatch = pathname.match(/^\/sections\/([^/]+)\/check$/);
   if (checkMatch && req.method === "PATCH") {
     const section = db.sections.find((item) => item.id === checkMatch[1]);
@@ -224,8 +208,11 @@ async function handle(req, res) {
     const body = await parseBody(req);
     section.checked = body.checked !== undefined ? Boolean(body.checked) : true;
     section.note = body.note ?? section.note;
+    section.proofState = section.checked ? "confirmed" : "pending";
+    section.confirmedAt = section.checked ? new Date().toISOString() : null;
+    bumpVersion(section);
     await writeDb(db);
-    return send(res, 200, { data: section });
+    return send(res, 200, { data: proofreading.decorateSection(db, section, now) });
   }
 
   if (req.method === "GET" && pathname === "/issues") {
@@ -274,8 +261,22 @@ async function handle(req, res) {
   return send(res, 404, { error: "接口不存在", routes });
 }
 
+// 请求串行化：占用领取是“读-判断-写”流程，并发请求交错会互相覆盖占用，
+// 这里用链队列保证每个请求原子完成读改写。
+let queueTail = Promise.resolve();
+
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  queueTail = queueTail
+    .catch(() => {})
+    .then(() => handle(req, res))
+    .catch((error) => {
+      const status = error.status || 500;
+      send(res, status, {
+        error: error.message || "服务器错误",
+        code: error.code || "INTERNAL_ERROR",
+        ...(error.details ? { details: error.details } : {})
+      });
+    });
 });
 
 server.listen(PORT, () => {
